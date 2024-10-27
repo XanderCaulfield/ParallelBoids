@@ -1,15 +1,8 @@
 use bevy::{
-    app::AppExit,
-    diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
-    prelude::*,
-    sprite::{Anchor, MaterialMesh2dBundle},
-    time::{Timer, TimerMode, Fixed},
-    input::{
+    app::AppExit, diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin}, input::{
         keyboard::KeyboardInput,
         ButtonState,
-    },
-    
-    
+    }, prelude::*, sprite::{Anchor, MaterialMesh2dBundle}, tasks::{AsyncComputeTaskPool, TaskPoolBuilder}, time::{Fixed, Timer, TimerMode}
 };
 use clap::Command;
 use noise::{NoiseFn, Perlin};
@@ -106,6 +99,9 @@ pub enum UIElement {
 // ==================== RESOURCES ====================
 // ===================================================
 
+#[derive(Resource)]
+struct ComputePool(&'static AsyncComputeTaskPool);
+
 /// Spatial partitioning grid for efficient neighbor lookups
 /// Uses a BTreeMap to maintain deterministic ordering of cells
 #[derive(Resource)]
@@ -172,6 +168,14 @@ pub struct SimulationConfig {
     pub rng_seed: u64,
     pub noise_seed: u32,
     pub boid_count: usize,
+}
+
+// System to ensure proper ordering
+#[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone)]
+enum SimulationSet {
+    GridUpdate,
+    ParameterUpdate,
+    PhysicsUpdate,
 }
 
 /// Tracks performance metrics for benchmarking and analysis
@@ -854,156 +858,157 @@ fn apply_parameter_schedule(
 /// Main physics system that runs at a fixed timestep
 /// This is crucial for deterministic behavior as it ensures consistent simulation steps
 /// regardless of frame rate
-fn fixed_timestep_physics(
-    fixed_time: Res<Time<Fixed>>,
-    mut metrics: ResMut<PerformanceMetrics>,
-    mut validator: ResMut<DeterminismValidator>,
-    mut query: Query<(Entity, &mut Transform, &mut Boid, &GridPosition)>,
+fn parallel_physics_update(
+    mut query: Query<(Entity, &mut Transform, &mut Boid, &mut GridPosition)>,
     grid: Res<SpatialGrid>,
     params: Res<SimulationParams>,
     config: Res<SimulationConfig>,
     window_query: Query<&Window>,
+    mut metrics: ResMut<PerformanceMetrics>,
+    mut validator: ResMut<DeterminismValidator>,
+    time: Res<Time<Fixed>>,
 ) {
     metrics.begin_physics();
     
-    let dt = fixed_time.delta_seconds();
+    let dt = time.delta_seconds();
     let validation_mode = validator.validation_mode.clone();
     let current_step = validator.current_step;
     
     let window = window_query.single();
     let width = window.width();
     let height = window.height();
-    
-    // 1. Collect all current states in a deterministic order
-    let mut boid_states: Vec<(Entity, BoidState, &Boid, &GridPosition)> = query
-        .iter()
-        .map(|(entity, transform, boid, grid_pos)| {
-            (entity, 
-             BoidState {
+
+    // Collect initial states for deterministic validation
+    let initial_states: Vec<_> = query.iter()
+        .map(|(_, transform, boid, _)| {
+            (boid.id, BoidState {
                 position: transform.translation.truncate(),
                 velocity: boid.velocity,
-             },
-             boid,
-             grid_pos)
+            })
         })
         .collect();
-    
-    // 2. Sort by entity ID for deterministic ordering
-    boid_states.sort_by_key(|(_, _, boid, _)| boid.id);
-    
-    // 3. Calculate updates using spatial grid for efficient neighbor lookup
+
     metrics.begin_movement();
-    let updates: Vec<(Entity, Vec2, Vec2)> = boid_states
-        .iter()
-        .map(|(entity, state, boid, grid_pos)| {
-            let mut neighbors: Vec<&BoidState> = Vec::new();
-            
-            // Calculate cell range based on visual range
-            let cell_range = (params.visual_range / GRID_CELL_SIZE).ceil() as i32;
-            
-            // Check cells within the calculated range
-            for dy in -cell_range..=cell_range {
-                for dx in -cell_range..=cell_range {
-                    let check_cell = grid_pos.cell + IVec2::new(dx, dy);
-                    
-                    if !SpatialGrid::is_in_range(grid_pos.cell, check_cell, params.visual_range) {
-                        continue;
-                    }
-                    
-                    if let Some(cell_entities) = grid.cells.get(&GridKey::from(check_cell)) {
-                        // Add states for boids in this cell
-                        for &(other_entity, _) in cell_entities {
-                            if other_entity != *entity {
-                                if let Some(other_state) = boid_states.iter()
-                                    .find(|(e, _, _, _)| *e == other_entity)
-                                    .map(|(_, state, _, _)| state) {
-                                    
-                                    // Final precise distance check
-                                    let diff = other_state.position - state.position;
-                                    if diff.length() <= params.visual_range {
-                                        neighbors.push(other_state);
-                                    }
-                                }
+
+    query.par_iter_mut().for_each(|(entity, mut transform, mut boid, mut grid_pos)| {
+        let mut neighbors = Vec::new();
+        let cell_range = (params.visual_range / GRID_CELL_SIZE).ceil() as i32;
+        
+        // Collect neighbors deterministically
+        for dy in -cell_range..=cell_range {
+            for dx in -cell_range..=cell_range {
+                let check_cell = grid_pos.cell + IVec2::new(dx, dy);
+                
+                if !SpatialGrid::is_in_range(grid_pos.cell, check_cell, params.visual_range) {
+                    continue;
+                }
+                
+                if let Some(cell_boids) = grid.cells.get(&GridKey::from(check_cell)) {
+                    for &(other_entity, other_id) in cell_boids {
+                        if other_entity != entity {
+                            if let Some(&(_, ref state)) = initial_states.iter()
+                                .find(|&&(id, _)| id == other_id) {
+                                neighbors.push(state);
                             }
                         }
                     }
                 }
             }
-            
-            neighbors.sort_by(|a, b| {
-                a.position.x.partial_cmp(&b.position.x)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.position.y.partial_cmp(&b.position.y)
-                        .unwrap_or(std::cmp::Ordering::Equal))
-            });
-            
-            let (new_velocity, new_position) = 
-                calculate_boid_update(state, boid, &neighbors, &params, dt, &config);
-
-            // Apply screen wrapping
-            let wrapped_position = Vec2::new(
-                (new_position.x + width / 2.0).rem_euclid(width) - width / 2.0,
-                (new_position.y + height / 2.0).rem_euclid(height) - height / 2.0
-            );
-            
-            (*entity, new_velocity, wrapped_position)
-        })
-        .collect();
-    metrics.end_movement();
-
-    // 4. Apply updates in deterministic order
-    for (entity, new_velocity, new_position) in updates {
-        if let Ok((_, mut transform, mut boid, _)) = query.get_mut(entity) {
-            boid.velocity = new_velocity;
-            transform.translation = new_position.extend(transform.translation.z);
-            boid.frame_count += 1;
-            
-            // Update trail
-            if params.trace_paths {
-                boid.trail.push(new_position);
-                if boid.trail.len() > TRAIL_LENGTH {
-                    boid.trail.remove(0);
-                }
-            }
-            
-            // Update rotation deterministically
-            if boid.velocity.length_squared() > 0.0 {
-                let angle = boid.velocity.y.atan2(boid.velocity.x);
-                transform.rotation = Quat::from_rotation_z(angle - std::f32::consts::FRAC_PI_2);
-            }
         }
-    }
 
-    metrics.end_physics();
+        // Sort neighbors deterministically
+        neighbors.sort_by(|a, b| {
+            a.position.x.partial_cmp(&b.position.x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.position.y.partial_cmp(&b.position.y)
+                    .unwrap_or(std::cmp::Ordering::Equal))
+        });
 
-    // 5. Validation handling
-    let final_states: Vec<BoidState> = query.iter().map(|(_, transform, boid, _)| {
-        BoidState {
+        // Calculate new position and velocity
+        let current_state = BoidState {
             position: transform.translation.truncate(),
             velocity: boid.velocity,
-        }
-    }).collect();
+        };
 
-    match validation_mode {
-        ValidationMode::Validating => {
-            if !validator.validate_state(current_step, &final_states, &params) {
-                error!("State validation failed at step {}", current_step);
+        let (new_velocity, new_position) = calculate_boid_update(
+            &current_state,
+            &boid,
+            &neighbors,
+            &params,
+            dt,
+            &config
+        );
+
+        // Apply screen wrapping
+        let wrapped_position = Vec2::new(
+            (new_position.x + width / 2.0).rem_euclid(width) - width / 2.0,
+            (new_position.y + height / 2.0).rem_euclid(height) - height / 2.0
+        );
+
+        // Update entity state
+        boid.velocity = new_velocity;
+        transform.translation = wrapped_position.extend(transform.translation.z);
+        
+        // Update grid position if cell changed
+        let new_cell = SpatialGrid::world_to_cell(wrapped_position);
+        if new_cell != grid_pos.cell {
+            *grid_pos = GridPosition { cell: new_cell };
+        }
+        
+        // Update rotation deterministically
+        if new_velocity.length_squared() > 0.0 {
+            let angle = new_velocity.y.atan2(new_velocity.x);
+            transform.rotation = Quat::from_rotation_z(angle - std::f32::consts::FRAC_PI_2);
+        }
+
+        // Update trail if enabled
+        if params.trace_paths {
+            boid.trail.push(wrapped_position);
+            if boid.trail.len() > TRAIL_LENGTH {
+                boid.trail.remove(0);
             }
-            validator.current_step += 1;
-        },
-        ValidationMode::Recording => {
-            if current_step % 1000 == 0 {  // Record every 1000th step
-                validator.snapshots.push(StateSnapshot {
-                    step: current_step,
-                    boid_states: final_states,
-                    parameters: params.clone(),
-                });
-            }
-            validator.current_step += 1;
-        },
-        ValidationMode::Disabled => {}
+        }
+
+        boid.frame_count += 1;
+    });
+
+    metrics.end_movement();
+    metrics.end_physics();
+
+    // Handle validation after parallel update
+    if validation_mode != ValidationMode::Disabled {
+        let final_states: Vec<BoidState> = query.iter()
+            .map(|(_, transform, boid, _)| {
+                BoidState {
+                    position: transform.translation.truncate(),
+                    velocity: boid.velocity,
+                }
+            })
+            .collect();
+
+        match validation_mode {
+            ValidationMode::Validating => {
+                if !validator.validate_state(current_step, &final_states, &params) {
+                    error!("State validation failed at step {}", current_step);
+                }
+                validator.current_step += 1;
+            },
+            ValidationMode::Recording => {
+                if current_step % 1000 == 0 {
+                    validator.snapshots.push(StateSnapshot {
+                        step: current_step,
+                        boid_states: final_states,
+                        parameters: params.clone(),
+                    });
+                }
+                validator.current_step += 1;
+            },
+            ValidationMode::Disabled => {}
+        }
     }
 }
+
+
 
 /// Calculates the new velocity and position for a single boid
 /// All inputs are processed in a deterministic order
@@ -1103,36 +1108,46 @@ fn get_deterministic_noise(perlin: &Perlin, boid: &Boid, frame: u64) -> f32 {
 
 /// Updates the spatial grid for efficient neighbor lookups
 /// Maintains deterministic ordering of entities within cells
+/// First system to collect positions and build updates deterministically
+fn collect_spatial_updates(
+    query: Query<(Entity, &Transform, &Boid)>,
+) -> Vec<(Entity, IVec2, u64)> {
+    let mut updates: Vec<_> = query.iter()
+        .map(|(entity, transform, boid)| {
+            let position = transform.translation.truncate();
+            let cell = SpatialGrid::world_to_cell(position);
+            (entity, cell, boid.id)
+        })
+        .collect();
+    
+    updates.sort_by_key(|&(_, _, id)| id);
+    updates
+}
+
+/// Second system to apply the updates to the grid
 fn update_spatial_grid(
+    In(updates): In<Vec<(Entity, IVec2, u64)>>,
     mut grid: ResMut<SpatialGrid>,
-    query: Query<(Entity, &Transform, &GridPosition, &Boid)>,
-    mut commands: Commands,
     mut metrics: ResMut<PerformanceMetrics>,
 ) {
     metrics.begin_spatial();
     
     grid.cells.clear();
     
-    for (entity, transform, grid_pos, boid) in query.iter() {
-        let position = transform.translation.truncate();
-        let new_cell = SpatialGrid::world_to_cell(position);
-        
-        if new_cell != grid_pos.cell {
-            commands.entity(entity).insert(GridPosition { cell: new_cell });
-        }
-        
-        grid.cells.entry(GridKey::from(new_cell))
-            .or_default()
-            .push((entity, boid.id));
+    for (entity, cell, id) in updates {
+        grid.cells.entry(GridKey::from(cell))
+            .or_insert_with(|| Vec::with_capacity(4))  // Only Vec needs capacity
+            .push((entity, id));
     }
 
-    // Sort entities within each cell by boid ID for deterministic ordering
+    // Sort entities within each cell
     for entities in grid.cells.values_mut() {
         entities.sort_by_key(|&(_, id)| id);
     }
 
     metrics.end_spatial();
 }
+
 
 // ====================================================
 // ==================== UI SYSTEMS ====================
@@ -1763,6 +1778,11 @@ fn handle_non_interactive_modes(
 
 fn main() {
     let config = SimulationConfig::from_args();
+
+    TaskPoolBuilder::new()
+        .num_threads((std::thread::available_parallelism().unwrap().get()) * 2)
+        .thread_name("AsyncComputeThread".to_string())
+        .build();
     
     let mut app = App::new();
     
@@ -1784,17 +1804,31 @@ fn main() {
         .insert_resource(SimulationParams::default())
         .insert_resource(SpatialGrid::default())
         .insert_resource(DebugConfig::default())
-        .insert_resource(Time::<Fixed>::from_seconds(FIXED_TIME_STEP.into()));
+        .insert_resource(Time::<Fixed>::from_seconds(FIXED_TIME_STEP.into()))
+        .insert_resource(ComputePool(AsyncComputeTaskPool::get()));
 
-    // Common systems for all modes
+    // Configure the simulation sets
+    app.configure_sets(FixedUpdate, (
+        SimulationSet::GridUpdate,
+        SimulationSet::ParameterUpdate,
+        SimulationSet::PhysicsUpdate,
+    ).chain());
+
+    // Add the core systems in the correct order
     app.add_systems(Startup, setup)
         .add_systems(FixedUpdate, (
-            apply_parameter_schedule,
-            fixed_timestep_physics,
-            update_spatial_grid,
-        ).chain());
+            collect_spatial_updates.pipe(update_spatial_grid)
+        ).in_set(SimulationSet::GridUpdate))
+        .add_systems(FixedUpdate, 
+            apply_parameter_schedule
+            .in_set(SimulationSet::ParameterUpdate)
+        )
+        .add_systems(FixedUpdate, 
+            parallel_physics_update
+            .in_set(SimulationSet::PhysicsUpdate)
+        );
 
-    // Add frame timing system to run last
+    // Add frame timing system
     app.add_systems(Update, track_frame_times.in_set(TimingSet::FrameTiming))
         .configure_sets(Update, (TimingSet::FrameTiming,).after(handle_non_interactive_modes));
 
